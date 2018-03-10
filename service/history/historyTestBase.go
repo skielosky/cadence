@@ -143,12 +143,10 @@ func (s *TestShardContext) GetTransferSequenceNumber() int64 {
 }
 
 // GetTimerAckLevel test implementation
-func (s *TestShardContext) GetTimerAckLevel() time.Time {
+func (s *TestShardContext) GetTimerAckLevel(cluster string) time.Time {
 	s.RLock()
 	defer s.RUnlock()
 
-	// TODO change make this cluster input parameter
-	cluster := s.clusterMetadata.GetCurrentClusterName()
 	// if can find corresponding ack level in the cluster to timer ack level map
 	if ackLevel, ok := s.shardInfo.ClusterTimerAckLevel[cluster]; ok {
 		return ackLevel
@@ -158,12 +156,10 @@ func (s *TestShardContext) GetTimerAckLevel() time.Time {
 }
 
 // UpdateTimerAckLevel test implementation
-func (s *TestShardContext) UpdateTimerAckLevel(ackLevel time.Time) error {
+func (s *TestShardContext) UpdateTimerAckLevel(cluster string, ackLevel time.Time) error {
 	s.RLock()
 	defer s.RUnlock()
 
-	// TODO change make this cluster input parameter
-	cluster := s.clusterMetadata.GetCurrentClusterName()
 	if cluster == s.clusterMetadata.GetCurrentClusterName() {
 		s.shardInfo.TimerAckLevel = ackLevel
 	}

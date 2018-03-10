@@ -57,8 +57,8 @@ type (
 		GetConfig() *Config
 		GetLogger() bark.Logger
 		GetMetricsClient() metrics.Client
-		GetTimerAckLevel() time.Time
-		UpdateTimerAckLevel(ackLevel time.Time) error
+		GetTimerAckLevel(cluster string) time.Time
+		UpdateTimerAckLevel(cluster string, ackLevel time.Time) error
 		GetTimeSource() common.TimeSource
 	}
 
@@ -146,12 +146,10 @@ func (s *shardContextImpl) UpdateTransferAckLevel(ackLevel int64) error {
 	return s.updateShardInfoLocked()
 }
 
-func (s *shardContextImpl) GetTimerAckLevel() time.Time {
+func (s *shardContextImpl) GetTimerAckLevel(cluster string) time.Time {
 	s.RLock()
 	defer s.RUnlock()
 
-	// TODO change make this cluster input parameter
-	cluster := s.clusterMetadata.GetCurrentClusterName()
 	// if can find corresponding ack level in the cluster to timer ack level map
 	if ackLevel, ok := s.shardInfo.ClusterTimerAckLevel[cluster]; ok {
 		return ackLevel
@@ -160,12 +158,10 @@ func (s *shardContextImpl) GetTimerAckLevel() time.Time {
 	return s.shardInfo.TimerAckLevel
 }
 
-func (s *shardContextImpl) UpdateTimerAckLevel(ackLevel time.Time) error {
+func (s *shardContextImpl) UpdateTimerAckLevel(cluster string, ackLevel time.Time) error {
 	s.Lock()
 	defer s.Unlock()
 
-	// TODO change make this cluster input parameter
-	cluster := s.clusterMetadata.GetCurrentClusterName()
 	if cluster == s.clusterMetadata.GetCurrentClusterName() {
 		s.shardInfo.TimerAckLevel = ackLevel
 	}

@@ -23,8 +23,6 @@ package history
 import (
 	"errors"
 	"fmt"
-	"math"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,144 +41,45 @@ var (
 	errTimerTaskNotFound          = errors.New("Timer task not found")
 	errFailedToAddTimeoutEvent    = errors.New("Failed to add timeout event")
 	errFailedToAddTimerFiredEvent = errors.New("Failed to add timer fired event")
-	maxTimestamp                  = time.Unix(0, math.MaxInt64)
 )
 
 type (
 	timerQueueProcessorImpl struct {
+		clusterMetadata  cluster.Metadata
 		historyService   *historyEngineImpl
 		cache            *historyCache
 		executionManager persistence.ExecutionManager
-		clusterMetadata  cluster.Metadata
 		isStarted        int32
 		isStopped        int32
 		shutdownWG       sync.WaitGroup
 		shutdownCh       chan struct{}
-		newTimerCh       chan struct{}
+		newTimerCh       chan time.Time
 		config           *Config
 		logger           bark.Logger
 		metricsClient    metrics.Client
 		timerFiredCount  uint64
-		lock             sync.Mutex // Used to synchronize pending timers.
-		ackMgr           *timerAckMgr
-		minPendingTimer  time.Time // Track the minimum timer ID in memory.
-	}
-
-	timeGate struct {
-		tNextNanos, tNowNanos int64
-		timer                 *time.Timer // timer used to wake us up when the next message is ready to deliver
-		gateC                 chan struct{}
-		closeC                chan struct{}
-	}
-
-	timerAckMgr struct {
-		sync.RWMutex
-		processor        *timerQueueProcessorImpl
-		shard            ShardContext
-		executionMgr     persistence.ExecutionManager
-		logger           bark.Logger
-		outstandingTasks map[SequenceID]bool
-		readLevel        SequenceID
-		ackLevel         time.Time
-		metricsClient    metrics.Client
-		lastUpdated      time.Time
-		config           *Config
+		timerQueueAckMgr *timerQueueAckMgr
 	}
 )
 
-func newTimeGate() *timeGate {
-	tNow := time.Now()
-
-	// Initialize timeGate to fire immediately to check for any outstanding timer which needs to be fired immediately
-	t := &timeGate{
-		tNowNanos: tNow.UnixNano(),
-		gateC:     make(chan struct{}),
-		closeC:    make(chan struct{}),
-		timer:     time.NewTimer(0),
-	}
-
-	// "Cast" chan Time to chan struct{}.
-	// Unfortunately go doesn't have a common channel supertype.
-	go func() {
-		defer close(t.gateC)
-		defer t.timer.Stop()
-	loop:
-		for {
-			select {
-			case <-t.timer.C:
-				// re-transmit on gateC
-				t.gateC <- struct{}{}
-
-			case <-t.closeC:
-				// closed; cleanup and quit
-				break loop
-			}
-		}
-	}()
-
-	return t
-}
-
-func (t *timeGate) beforeSleep() <-chan struct{} {
-	// update current time on gate
-	tNow := time.Now()
-	t.tNowNanos = tNow.UnixNano()
-
-	return t.gateC
-}
-
-func (t *timeGate) engaged(now int64) bool {
-	return t.tNextNanos > now
-}
-
-// setNext is called by processor in following 2 conditions:
-// 1. Processor is woken up by new timer creation and new timer is scheduled to fire before current tNextNanos
-// 2. Processor finds a lockAheadTask from cassandra and calls it using the visibility time of the task
-func (t *timeGate) setNext(next time.Time) bool {
-	newNext := next.UnixNano()
-
-	tNow := time.Now()
-	t.tNowNanos = tNow.UnixNano()
-	// Check to see if passed in next should become the next time timeGate notifies processor
-	if !t.engaged(t.tNowNanos) || t.tNextNanos > newNext {
-		t.tNextNanos = newNext
-		// reset timer to fire when the next message should be made 'visible'
-		t.timer.Reset(time.Unix(0, t.tNextNanos).Sub(tNow))
-
-		// Notifies caller that next notification is reset to fire at passed in 'next' visibility time
-		return true
-	}
-
-	return false
-}
-
-func (t *timeGate) close() {
-	close(t.closeC)
-}
-
-func (t *timeGate) String() string {
-	return fmt.Sprintf("timeGate [engaged=%v tNextNanos=%v tNowNanos=%v]",
-		t.engaged(time.Now().UnixNano()), time.Unix(0, t.tNextNanos), time.Unix(0, t.tNowNanos))
-}
-
 func newTimerQueueProcessor(shard ShardContext, historyService *historyEngineImpl, executionManager persistence.ExecutionManager,
 	clusterMetadata cluster.Metadata, logger bark.Logger) timerQueueProcessor {
-	l := logger.WithFields(bark.Fields{
+	log := logger.WithFields(bark.Fields{
 		logging.TagWorkflowComponent: logging.TagValueTimerQueueComponent,
 	})
-	tp := &timerQueueProcessorImpl{
+	timerQueueProcessor := &timerQueueProcessorImpl{
+		clusterMetadata:  clusterMetadata,
 		historyService:   historyService,
 		cache:            historyService.historyCache,
-		clusterMetadata:  clusterMetadata,
 		executionManager: executionManager,
 		shutdownCh:       make(chan struct{}),
-		newTimerCh:       make(chan struct{}, 1),
+		newTimerCh:       make(chan time.Time, shard.GetConfig().TimerProcessorTimerChanSize),
 		config:           shard.GetConfig(),
-		logger:           l,
+		logger:           log,
 		metricsClient:    historyService.metricsClient,
+		timerQueueAckMgr: newTimerQueueAckMgr(clusterMetadata, shard, historyService.metricsClient, executionManager, log),
 	}
-	tp.ackMgr = newTimerAckMgr(tp, shard, executionManager, l)
-	return tp
+	return timerQueueProcessor
 }
 
 func (t *timerQueueProcessorImpl) Start() {
@@ -218,14 +117,11 @@ func (t *timerQueueProcessorImpl) NotifyNewTimer(timerTasks []persistence.Task) 
 	}
 	t.metricsClient.AddCounter(metrics.TimerQueueProcessorScope, metrics.NewTimerCounter, int64(len(timerTasks)))
 
-	updatedMinTimer := false
-	t.lock.Lock()
+	newEarlistTime := persistence.GetVisibilityTSFrom(timerTasks[0])
 	for _, task := range timerTasks {
 		ts := persistence.GetVisibilityTSFrom(task)
-		if t.minPendingTimer.IsZero() || ts.Before(t.minPendingTimer) {
-			// TODO: We should just send the visibility time through channel instead setting minPendingTimer
-			t.minPendingTimer = ts
-			updatedMinTimer = true
+		if ts.Before(newEarlistTime) {
+			newEarlistTime = ts
 		}
 
 		switch task.GetType() {
@@ -241,16 +137,12 @@ func (t *timerQueueProcessorImpl) NotifyNewTimer(timerTasks []persistence.Task) 
 			t.metricsClient.IncCounter(metrics.TimerTaskDeleteHistoryEvent, metrics.NewTimerCounter)
 		}
 	}
-	t.lock.Unlock()
 
-	if updatedMinTimer {
-		select {
-		case t.newTimerCh <- struct{}{}:
-			// Notified about new timer.
-
-		default:
-			// Channel "full" -> drop and move on, since we are using it as an event.
-		}
+	select {
+	case t.newTimerCh <- newEarlistTime:
+		// Notified about new timer.
+	default:
+		// Channel "full" -> drop and move on, this will happen only if service is in high load.
 	}
 }
 
@@ -286,18 +178,18 @@ RetryProcessor:
 }
 
 func (t *timerQueueProcessorImpl) internalProcessor(tasksCh chan<- *persistence.TimerTaskInfo) error {
-	gate := newTimeGate()
-	defer gate.close()
+	timer := NewTimer()
+	defer timer.Close()
 
 	updateAckChan := time.NewTicker(t.config.TimerProcessorUpdateAckInterval).C
 	var nextKeyTask *persistence.TimerTaskInfo
 
 continueProcessor:
 	for {
-		isWokeByNewTimer := false
+		var newEarlistTime time.Time
 
-		if nextKeyTask == nil || gate.engaged(time.Now().UnixNano()) {
-			gateC := gate.beforeSleep()
+		if nextKeyTask == nil || timer.WillFireAfter(time.Now()) {
+			timerChan := timer.GetTimerChan()
 
 			// Wait until one of four things occurs:
 			// 1. we get notified of a new message
@@ -311,36 +203,31 @@ continueProcessor:
 				t.logger.Debug("Timer queue processor pump shutting down.")
 				return nil
 
-			case <-gateC:
+			case <-timerChan:
 				// Timer Fired.
 
-			case <-t.newTimerCh:
+			case newEarlistTime = <-t.newTimerCh:
 				// New Timer has arrived.
-				isWokeByNewTimer = true
 
 			case <-updateAckChan:
-				t.ackMgr.updateAckLevel()
+				t.timerQueueAckMgr.updateAckLevel(t.clusterMetadata.GetCurrentClusterName())
 				continue continueProcessor
 			}
 		}
 
-		if isWokeByNewTimer {
+		if !newEarlistTime.IsZero() {
 			t.metricsClient.IncCounter(metrics.TimerQueueProcessorScope, metrics.NewTimerNotifyCounter)
 			t.logger.Debugf("Woke up by the timer")
 
-			t.lock.Lock()
-			newMinTimestamp := t.minPendingTimer
-			if gate.setNext(newMinTimestamp) {
+			if timer.UpdateTimer(newEarlistTime) {
+				// this means timer is updated, to the new earltest time
 				// reset the nextKeyTask as the new timer is expected to fire before previously read nextKeyTask
 				nextKeyTask = nil
 			}
-			t.minPendingTimer = time.Time{}
-			t.lock.Unlock()
 
-			t.logger.Debugf("%v: Next key after woke up by timer: %v",
-				time.Now().UTC(), newMinTimestamp.UTC())
+			t.logger.Debugf("%v: Next key after woke up by timer: %v", time.Now().UTC(), newEarlistTime.UTC())
 
-			if !t.isProcessNow(time.Unix(0, gate.tNextNanos)) {
+			if timer.WillFireAfter(time.Now()) {
 				continue continueProcessor
 			}
 		}
@@ -349,7 +236,7 @@ continueProcessor:
 	ProcessPendingTimers:
 		for {
 			// Get next set of timer tasks.
-			timerTasks, lookAheadTask, moreTasks, err := t.getTasksAndNextKey()
+			timerTasks, lookAheadTask, moreTasks, err := t.timerQueueAckMgr.readTimerTasks(t.clusterMetadata.GetCurrentClusterName())
 			if err != nil {
 				return err
 			}
@@ -367,45 +254,12 @@ continueProcessor:
 		}
 
 		if nextKeyTask != nil {
-			nextKey := SequenceID{VisibilityTimestamp: nextKeyTask.VisibilityTimestamp, TaskID: nextKeyTask.TaskID}
+			nextKey := TimerSequenceID{VisibilityTimestamp: nextKeyTask.VisibilityTimestamp, TaskID: nextKeyTask.TaskID}
 			t.logger.Debugf("%s: GetNextKey: %s", time.Now().UTC(), nextKey)
 
-			gate.setNext(nextKey.VisibilityTimestamp)
+			timer.UpdateTimer(nextKey.VisibilityTimestamp)
 		}
 	}
-}
-
-func (t *timerQueueProcessorImpl) isProcessNow(expiryTime time.Time) bool {
-	return !expiryTime.IsZero() && expiryTime.UnixNano() <= time.Now().UnixNano()
-}
-
-func (t *timerQueueProcessorImpl) getTasksAndNextKey() ([]*persistence.TimerTaskInfo, *persistence.TimerTaskInfo, bool,
-	error) {
-	tasks, lookAheadTask, moreTasks, err := t.ackMgr.readTimerTasks()
-	if err != nil {
-		return nil, nil, false, err
-	}
-	return tasks, lookAheadTask, moreTasks, nil
-}
-
-func (t *timerQueueProcessorImpl) getTimerTasks(
-	minTimestamp time.Time,
-	maxTimestamp time.Time,
-	batchSize int) ([]*persistence.TimerTaskInfo, error) {
-	request := &persistence.GetTimerIndexTasksRequest{
-		MinTimestamp: minTimestamp,
-		MaxTimestamp: maxTimestamp,
-		BatchSize:    batchSize}
-
-	for attempt := 1; attempt <= t.config.TimerProcessorGetFailureRetryCount; attempt++ {
-		response, err := t.executionManager.GetTimerIndexTasks(request)
-		if err == nil {
-			return response.Timers, nil
-		}
-		backoff := time.Duration(attempt * 100)
-		time.Sleep(backoff * time.Millisecond)
-	}
-	return nil, ErrMaxAttemptsExceeded
 }
 
 func (t *timerQueueProcessorImpl) processTaskWorker(tasksCh <-chan *persistence.TimerTaskInfo, workerWG *sync.WaitGroup) {
@@ -421,17 +275,17 @@ func (t *timerQueueProcessorImpl) processTaskWorker(tasksCh <-chan *persistence.
 
 		UpdateFailureLoop:
 			for attempt := 1; attempt <= t.config.TimerProcessorUpdateFailureRetryCount; attempt++ {
-				taskID := SequenceID{VisibilityTimestamp: task.VisibilityTimestamp, TaskID: task.TaskID}
+				taskID := TimerSequenceID{VisibilityTimestamp: task.VisibilityTimestamp, TaskID: task.TaskID}
 				err = t.processTimerTask(task)
 				if err != nil && err != errTimerTaskNotFound {
 					// We will retry until we don't find the timer task any more.
-					t.logger.Infof("Failed to process timer with SequenceID: %s with error: %v",
+					t.logger.Infof("Failed to process timer with TimerSequenceID: %s with error: %v",
 						taskID, err)
 					backoff := time.Duration(attempt * 100)
 					time.Sleep(backoff * time.Millisecond)
 				} else {
 					// Completed processing the timer task.
-					t.ackMgr.completeTimerTask(taskID)
+					t.timerQueueAckMgr.completeTimerTask(t.clusterMetadata.GetCurrentClusterName(), taskID)
 					break UpdateFailureLoop
 				}
 			}
@@ -440,7 +294,7 @@ func (t *timerQueueProcessorImpl) processTaskWorker(tasksCh <-chan *persistence.
 }
 
 func (t *timerQueueProcessorImpl) processTimerTask(timerTask *persistence.TimerTaskInfo) error {
-	taskID := SequenceID{VisibilityTimestamp: timerTask.VisibilityTimestamp, TaskID: timerTask.TaskID}
+	taskID := TimerSequenceID{VisibilityTimestamp: timerTask.VisibilityTimestamp, TaskID: timerTask.TaskID}
 	t.logger.Debugf("Processing timer: (%s), for WorkflowID: %v, RunID: %v, Type: %v, TimeoutType: %v, EventID: %v",
 		taskID, timerTask.WorkflowID, timerTask.RunID, t.getTimerTaskType(timerTask.TaskType),
 		workflow.TimeoutType(timerTask.TimeoutType).String(), timerTask.EventID)
@@ -927,144 +781,4 @@ func (t *timerQueueProcessorImpl) getTimerTaskType(taskType int) string {
 		return "DeleteHistoryEvent"
 	}
 	return "UnKnown"
-}
-
-type timerTaskIDs []SequenceID
-
-// Len implements sort.Interace
-func (t timerTaskIDs) Len() int {
-	return len(t)
-}
-
-// Swap implements sort.Interface.
-func (t timerTaskIDs) Swap(i, j int) {
-	t[i], t[j] = t[j], t[i]
-}
-
-// Less implements sort.Interface
-func (t timerTaskIDs) Less(i, j int) bool {
-	return compareTimerIDLess(&t[i], &t[j])
-}
-
-func newTimerAckMgr(processor *timerQueueProcessorImpl, shard ShardContext, executionMgr persistence.ExecutionManager,
-	logger bark.Logger) *timerAckMgr {
-	ackLevel := shard.GetTimerAckLevel()
-	config := shard.GetConfig()
-	return &timerAckMgr{
-		processor:        processor,
-		shard:            shard,
-		executionMgr:     executionMgr,
-		outstandingTasks: make(map[SequenceID]bool),
-		readLevel:        SequenceID{VisibilityTimestamp: ackLevel},
-		ackLevel:         ackLevel,
-		metricsClient:    processor.metricsClient,
-		logger:           logger,
-		lastUpdated:      time.Now(),
-		config:           config,
-	}
-}
-
-func (t *timerAckMgr) readTimerTasks() ([]*persistence.TimerTaskInfo, *persistence.TimerTaskInfo, bool, error) {
-	t.RLock()
-	rLevel := t.readLevel
-	t.RUnlock()
-
-	tasks, err := t.processor.getTimerTasks(rLevel.VisibilityTimestamp, maxTimestamp, t.processor.config.TimerTaskBatchSize)
-	if err != nil {
-		return nil, nil, false, err
-	}
-
-	taskCount := len(tasks)
-	t.logger.Debugf("readTimerTasks: ReadLevel: (%s) count: %v", rLevel, taskCount)
-
-	// We filter tasks so read only moves to desired timer tasks.
-	// We also get a look ahead task but it doesn't move the read level, this is for timer
-	// to wait on it instead of doing queries.
-
-	var lookAheadTask *persistence.TimerTaskInfo
-	filteredTasks := []*persistence.TimerTaskInfo{}
-
-	t.Lock()
-	for _, task := range tasks {
-		taskSeq := SequenceID{VisibilityTimestamp: task.VisibilityTimestamp, TaskID: task.TaskID}
-		if _, ok := t.outstandingTasks[taskSeq]; ok {
-			t.logger.Infof("Skipping task: %v.  WorkflowID: %v, RunID: %v, Type: %v", taskSeq.String(), task.WorkflowID,
-				task.RunID, task.TaskType)
-			continue
-		}
-		if task.VisibilityTimestamp.Before(t.readLevel.VisibilityTimestamp) {
-			t.logger.Fatalf(
-				"Next timer task time stamp is less than current timer task read level. timer task: (%s), ReadLevel: (%s)",
-				taskSeq, t.readLevel)
-		}
-
-		if !t.processor.isProcessNow(task.VisibilityTimestamp) {
-			lookAheadTask = task
-			break
-		}
-
-		t.logger.Debugf("Moving timer read level: (%s)", taskSeq)
-		t.readLevel = taskSeq
-		t.outstandingTasks[t.readLevel] = false
-		filteredTasks = append(filteredTasks, task)
-	}
-	t.Unlock()
-
-	// We may have large number of timers which need to be fired immediately.  Return true in such case so the pump
-	// can call back immediately to retrieve more tasks
-	moreTasks := lookAheadTask == nil && taskCount == t.processor.config.TimerTaskBatchSize
-
-	return filteredTasks, lookAheadTask, moreTasks, nil
-}
-
-func (t *timerAckMgr) completeTimerTask(taskID SequenceID) {
-	t.Lock()
-	if _, ok := t.outstandingTasks[taskID]; ok {
-		t.outstandingTasks[taskID] = true
-	}
-	t.Unlock()
-}
-
-func (t *timerAckMgr) updateAckLevel() {
-	t.metricsClient.IncCounter(metrics.TimerQueueProcessorScope, metrics.AckLevelUpdateCounter)
-	initialAckLevel := t.ackLevel
-	updatedAckLevel := t.ackLevel
-	t.Lock()
-
-	// Timer IDs can have holes in the middle. So we sort the map to get the order to
-	// check. TODO: we can maintain a sorted slice as well.
-	var taskIDs timerTaskIDs
-	for k := range t.outstandingTasks {
-		taskIDs = append(taskIDs, k)
-	}
-	sort.Sort(taskIDs)
-
-MoveAckLevelLoop:
-	for _, current := range taskIDs {
-		if acked, ok := t.outstandingTasks[current]; ok {
-			if acked {
-				t.ackLevel = current.VisibilityTimestamp
-				updatedAckLevel = current.VisibilityTimestamp
-				delete(t.outstandingTasks, current)
-			} else {
-				break MoveAckLevelLoop
-			}
-		}
-	}
-	t.Unlock()
-
-	// Do not update Acklevel if nothing changed upto force update interval
-	if initialAckLevel == updatedAckLevel && time.Since(t.lastUpdated) < t.config.TimerProcessorForceUpdateInterval {
-		return
-	}
-
-	t.logger.Debugf("Updating timer ack level: %v", updatedAckLevel)
-
-	// Always update ackLevel to detect if the shared is stolen
-	if err := t.shard.UpdateTimerAckLevel(updatedAckLevel); err != nil {
-		t.metricsClient.IncCounter(metrics.TimerQueueProcessorScope, metrics.AckLevelUpdateFailedCounter)
-		t.logger.Errorf("Error updating timer ack level for shard: %v", err)
-	} else {
-		t.lastUpdated = time.Now()
-	}
 }
