@@ -35,6 +35,7 @@ import (
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/cache"
+	"github.com/uber/cadence/common/cluster"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/mocks"
 	"github.com/uber/cadence/common/persistence"
@@ -49,6 +50,7 @@ type (
 		mockHistoryClient *mocks.HistoryClient
 		mockMetadataMgr   *mocks.MetadataManager
 		mockVisibilityMgr *mocks.VisibilityManager
+		clusterMetadata   cluster.Metadata
 		logger            bark.Logger
 	}
 )
@@ -89,6 +91,7 @@ func (s *transferQueueProcessorSuite) SetupTest() {
 	s.mockHistoryClient = &mocks.HistoryClient{}
 	s.mockVisibilityMgr = &mocks.VisibilityManager{}
 	s.mockMetadataMgr = &mocks.MetadataManager{}
+	s.clusterMetadata = cluster.GetTestClusterMetadata(false, false)
 
 	historyCache := newHistoryCache(s.ShardContext, s.logger)
 	domainCache := cache.NewDomainCache(s.mockMetadataMgr, s.logger)
@@ -105,7 +108,7 @@ func (s *transferQueueProcessorSuite) SetupTest() {
 
 	mockExecutionMgr := &mocks.ExecutionManager{}
 	txProcesser := newTransferQueueProcessor(s.ShardContext, h, s.mockVisibilityMgr, s.mockMatching, s.mockHistoryClient).(*transferQueueProcessorImpl)
-	timerProcessor := newTimerQueueProcessor(s.ShardContext, h, mockExecutionMgr, s.logger)
+	timerProcessor := newTimerQueueProcessor(s.ShardContext, h, mockExecutionMgr, s.clusterMetadata, s.logger)
 	s.processor = txProcesser
 	h.txProcessor = txProcesser
 	h.timerProcessor = timerProcessor

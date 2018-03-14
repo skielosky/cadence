@@ -36,6 +36,7 @@ import (
 	"github.com/uber/cadence/client/matching"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/cache"
+	"github.com/uber/cadence/common/cluster"
 	"github.com/uber/cadence/common/logging"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/persistence"
@@ -61,6 +62,7 @@ type (
 		historyCache         *historyCache
 		domainCache          cache.DomainCache
 		metricsClient        metrics.Client
+		clusterMetadata      cluster.Metadata
 		logger               bark.Logger
 	}
 
@@ -107,7 +109,7 @@ var (
 // NewEngineWithShardContext creates an instance of history engine
 func NewEngineWithShardContext(shard ShardContext, domainCache cache.DomainCache,
 	visibilityMgr persistence.VisibilityManager, matching matching.Client, historyClient hc.Client,
-	historyEventNotifier historyEventNotifier) Engine {
+	historyEventNotifier historyEventNotifier, clusterMetadata cluster.Metadata) Engine {
 	shardWrapper := &shardContextWrapper{
 		ShardContext:         shard,
 		historyEventNotifier: historyEventNotifier,
@@ -130,9 +132,10 @@ func NewEngineWithShardContext(shard ShardContext, domainCache cache.DomainCache
 		}),
 		metricsClient:        shard.GetMetricsClient(),
 		historyEventNotifier: historyEventNotifier,
+		clusterMetadata:      clusterMetadata,
 	}
 	txProcessor := newTransferQueueProcessor(shard, historyEngImpl, visibilityMgr, matching, historyClient)
-	historyEngImpl.timerProcessor = newTimerQueueProcessor(shard, historyEngImpl, executionManager, logger)
+	historyEngImpl.timerProcessor = newTimerQueueProcessor(shard, historyEngImpl, executionManager, historyEngImpl.clusterMetadata, logger)
 	historyEngImpl.txProcessor = txProcessor
 	shardWrapper.txProcessor = txProcessor
 	return historyEngImpl

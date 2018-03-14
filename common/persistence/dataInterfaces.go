@@ -122,8 +122,12 @@ type (
 		RangeID          int64
 		StolenSinceRenew int
 		UpdatedAt        time.Time
+		// TO BE DEPRECATED IN FAVOR OF ClusterTransferAckLevel
 		TransferAckLevel int64
-		TimerAckLevel    time.Time
+		// TO BE DEPRECATED IN FAVOR OF ClusteerTimerAckLevel
+		TimerAckLevel           time.Time
+		ClusterTransferAckLevel map[string]int64
+		ClusterTimerAckLevel    map[string]time.Time
 	}
 
 	// WorkflowExecutionInfo describes a workflow execution
@@ -576,7 +580,8 @@ type (
 
 	// GetTimerIndexTasksResponse is the response for GetTimerIndexTasks
 	GetTimerIndexTasksResponse struct {
-		Timers []*TimerTaskInfo
+		Timers        []*TimerTaskInfo
+		NextPageToken []byte
 	}
 
 	// SerializedHistoryEventBatch represents a serialized batch of history events

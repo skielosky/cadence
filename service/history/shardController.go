@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/uber/cadence/common/cache"
+	"github.com/uber/cadence/common/cluster"
 
 	"github.com/uber-common/bark"
 
@@ -59,6 +60,7 @@ type (
 		logger              bark.Logger
 		config              *Config
 		metricsClient       metrics.Client
+		clusterMetadata     cluster.Metadata
 
 		sync.RWMutex
 		historyShards map[int]*historyShardsItem
@@ -67,24 +69,25 @@ type (
 
 	historyShardsItem struct {
 		sync.RWMutex
-		shardID       int
-		shardMgr      persistence.ShardManager
-		historyMgr    persistence.HistoryManager
-		executionMgr  persistence.ExecutionManager
-		domainCache   cache.DomainCache
-		engineFactory EngineFactory
-		host          *membership.HostInfo
-		engine        Engine
-		config        *Config
-		logger        bark.Logger
-		metricsClient metrics.Client
+		shardID         int
+		shardMgr        persistence.ShardManager
+		historyMgr      persistence.HistoryManager
+		executionMgr    persistence.ExecutionManager
+		domainCache     cache.DomainCache
+		engineFactory   EngineFactory
+		host            *membership.HostInfo
+		engine          Engine
+		config          *Config
+		logger          bark.Logger
+		metricsClient   metrics.Client
+		clusterMetadata cluster.Metadata
 	}
 )
 
 func newShardController(host *membership.HostInfo, resolver membership.ServiceResolver,
 	shardMgr persistence.ShardManager, historyMgr persistence.HistoryManager, metadataMgr persistence.MetadataManager,
 	executionMgrFactory persistence.ExecutionManagerFactory, factory EngineFactory, config *Config,
-	logger bark.Logger, reporter metrics.Client) *shardController {
+	logger bark.Logger, metricsClient metrics.Client, clusterMetadata cluster.Metadata) *shardController {
 	return &shardController{
 		host:                host,
 		hServiceResolver:    resolver,
@@ -100,14 +103,15 @@ func newShardController(host *membership.HostInfo, resolver membership.ServiceRe
 		logger: logger.WithFields(bark.Fields{
 			logging.TagWorkflowComponent: logging.TagValueShardController,
 		}),
-		config:        config,
-		metricsClient: reporter,
+		config:          config,
+		metricsClient:   metricsClient,
+		clusterMetadata: clusterMetadata,
 	}
 }
 
 func newHistoryShardsItem(shardID int, shardMgr persistence.ShardManager, historyMgr persistence.HistoryManager,
 	metadataMgr persistence.MetadataManager, executionMgrFactory persistence.ExecutionManagerFactory, factory EngineFactory,
-	host *membership.HostInfo, config *Config, logger bark.Logger, metricsClient metrics.Client) (*historyShardsItem, error) {
+	host *membership.HostInfo, config *Config, logger bark.Logger, metricsClient metrics.Client, clusterMetadata cluster.Metadata) (*historyShardsItem, error) {
 
 	executionMgr, err := executionMgrFactory.CreateExecutionManager(shardID)
 	if err != nil {
@@ -128,7 +132,8 @@ func newHistoryShardsItem(shardID int, shardMgr persistence.ShardManager, histor
 		logger: logger.WithFields(bark.Fields{
 			logging.TagHistoryShardID: shardID,
 		}),
-		metricsClient: metricsClient,
+		metricsClient:   metricsClient,
+		clusterMetadata: clusterMetadata,
 	}, nil
 }
 
@@ -218,7 +223,7 @@ func (c *shardController) getOrCreateHistoryShardItem(shardID int) (*historyShar
 
 	if info.Identity() == c.host.Identity() {
 		shardItem, err := newHistoryShardsItem(shardID, c.shardMgr, c.historyMgr, c.metadataMgr,
-			c.executionMgrFactory, c.engineFactory, c.host, c.config, c.logger, c.metricsClient)
+			c.executionMgrFactory, c.engineFactory, c.host, c.config, c.logger, c.metricsClient, c.clusterMetadata)
 		if err != nil {
 			return nil, err
 		}
@@ -377,7 +382,7 @@ func (i *historyShardsItem) getOrCreateEngine(shardClosedCh chan<- int) (Engine,
 	logging.LogShardEngineCreatingEvent(i.logger, i.host.Identity(), i.shardID)
 
 	context, err := acquireShard(i.shardID, i.shardMgr, i.historyMgr, i.executionMgr, i.domainCache, i.host.Identity(), shardClosedCh,
-		i.config, i.logger, i.metricsClient)
+		i.config, i.logger, i.metricsClient, i.clusterMetadata)
 	if err != nil {
 		return nil, err
 	}

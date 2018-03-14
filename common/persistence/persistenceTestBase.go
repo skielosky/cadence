@@ -39,20 +39,12 @@ import (
 )
 
 const (
-	testWorkflowClusterHosts     = "127.0.0.1"
-	testPort                     = 0
-	testUser                     = ""
-	testPassword                 = ""
-	testDatacenter               = ""
-	testSchemaDir                = "../.."
-	testInitialFailoverVersion   = int64(0)
-	testFailoverVersionIncrement = int64(10)
-	testCurrentClusterName       = "current-cluster"
-	testAlternativeClusterName   = "alternative-cluster"
-)
-
-var (
-	testAllClusterNames = []string{testCurrentClusterName, testAlternativeClusterName}
+	testWorkflowClusterHosts = "127.0.0.1"
+	testPort                 = 0
+	testUser                 = ""
+	testPassword             = ""
+	testDatacenter           = ""
+	testSchemaDir            = "../.."
 )
 
 type (
@@ -120,17 +112,9 @@ func (g *testTransferTaskIDGenerator) GetNextTransferTaskID() (int64, error) {
 func (s *TestBase) SetupWorkflowStoreWithOptions(options TestBaseOptions) {
 	log := bark.NewLoggerFromLogrus(log.New())
 
-	masterClusterName := testCurrentClusterName
-	if !options.IsMasterCluster {
-		masterClusterName = testAlternativeClusterName
-	}
-	s.ClusterMetadata = cluster.NewMetadata(
+	s.ClusterMetadata = cluster.GetTestClusterMetadata(
 		options.EnableGlobalDomain,
-		testInitialFailoverVersion,
-		testFailoverVersionIncrement,
-		masterClusterName,
-		testCurrentClusterName,
-		testAllClusterNames,
+		options.IsMasterCluster,
 	)
 
 	// Setup Workflow keyspace and deploy schema for tests
@@ -138,7 +122,7 @@ func (s *TestBase) SetupWorkflowStoreWithOptions(options TestBaseOptions) {
 	shardID := 0
 	var err error
 	s.ShardMgr, err = NewCassandraShardPersistence(options.ClusterHost, options.ClusterPort, options.ClusterUser,
-		options.ClusterPassword, options.Datacenter, s.CassandraTestCluster.keyspace, log)
+		options.ClusterPassword, options.Datacenter, s.CassandraTestCluster.keyspace, s.ClusterMetadata.GetCurrentClusterName(), log)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -651,17 +635,17 @@ func (s *TestBase) CompleteTransferTask(taskID int64) error {
 }
 
 // GetTimerIndexTasks is a utility method to get tasks from transfer task queue
-func (s *TestBase) GetTimerIndexTasks() ([]*TimerTaskInfo, error) {
+func (s *TestBase) GetTimerIndexTasks() ([]*TimerTaskInfo, []byte, error) {
 	response, err := s.WorkflowMgr.GetTimerIndexTasks(&GetTimerIndexTasksRequest{
 		MinTimestamp: time.Time{},
 		MaxTimestamp: time.Unix(0, math.MaxInt64),
 		BatchSize:    10})
 
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return response.Timers, nil
+	return response.Timers, response.NextPageToken, nil
 }
 
 // CompleteTimerTask is a utility method to complete a timer task

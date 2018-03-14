@@ -28,6 +28,7 @@ import (
 
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/cache"
+	"github.com/uber/cadence/common/cluster"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/mocks"
 	"github.com/uber/cadence/common/persistence"
@@ -57,6 +58,7 @@ type (
 		mockExecutionMgr   *mocks.ExecutionManager
 		mockHistoryMgr     *mocks.HistoryManager
 		mockShard          ShardContext
+		clusterMetadata    cluster.Metadata
 	}
 )
 
@@ -86,6 +88,7 @@ func (s *timerQueueProcessor2Suite) SetupTest() {
 	s.mockVisibilityMgr = &mocks.VisibilityManager{}
 	s.mockMetadataMgr = &mocks.MetadataManager{}
 	s.shardClosedCh = make(chan int, 100)
+	s.clusterMetadata = cluster.GetTestClusterMetadata(false, false)
 
 	s.mockShard = &shardContextImpl{
 		shardInfo:                 &persistence.ShardInfo{ShardID: shardID, RangeID: 1, TransferAckLevel: 0},
@@ -99,6 +102,7 @@ func (s *timerQueueProcessor2Suite) SetupTest() {
 		logger:                    s.logger,
 		domainCache:               cache.NewDomainCache(s.mockMetadataMgr, s.logger),
 		metricsClient:             metrics.NewClient(tally.NoopScope, metrics.History),
+		clusterMetadata:           s.clusterMetadata,
 	}
 
 	historyCache := newHistoryCache(s.mockShard, s.logger)
@@ -115,7 +119,7 @@ func (s *timerQueueProcessor2Suite) SetupTest() {
 		domainCache:        domainCache,
 	}
 	h.txProcessor = newTransferQueueProcessor(s.mockShard, h, s.mockVisibilityMgr, s.mockMatchingClient, &mocks.HistoryClient{})
-	h.timerProcessor = newTimerQueueProcessor(s.mockShard, h, s.mockExecutionMgr, s.logger)
+	h.timerProcessor = newTimerQueueProcessor(s.mockShard, h, s.mockExecutionMgr, s.clusterMetadata, s.logger)
 	s.mockHistoryEngine = h
 }
 
@@ -180,7 +184,7 @@ func (s *timerQueueProcessor2Suite) TestTimerUpdateTimesOut() {
 	}).Once()
 
 	// Start timer Processor.
-	processor := newTimerQueueProcessor(s.mockShard, s.mockHistoryEngine, s.mockExecutionMgr, s.logger).(*timerQueueProcessorImpl)
+	processor := newTimerQueueProcessor(s.mockShard, s.mockHistoryEngine, s.mockExecutionMgr, s.clusterMetadata, s.logger).(*timerQueueProcessorImpl)
 	processor.Start()
 
 	processor.NotifyNewTimer([]persistence.Task{&persistence.DecisionTimeoutTask{
@@ -239,7 +243,7 @@ func (s *timerQueueProcessor2Suite) TestWorkflowTimeout() {
 		// Done.
 		waitCh <- struct{}{}
 	}).Once()
-	processor := newTimerQueueProcessor(s.mockShard, s.mockHistoryEngine, s.mockExecutionMgr, s.logger).(*timerQueueProcessorImpl)
+	processor := newTimerQueueProcessor(s.mockShard, s.mockHistoryEngine, s.mockExecutionMgr, s.clusterMetadata, s.logger).(*timerQueueProcessorImpl)
 	processor.Start()
 	<-waitCh
 

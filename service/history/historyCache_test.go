@@ -33,6 +33,7 @@ import (
 	"github.com/uber-go/tally"
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
+	"github.com/uber/cadence/common/cluster"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/mocks"
 	"github.com/uber/cadence/common/persistence"
@@ -48,6 +49,7 @@ type (
 		logger           bark.Logger
 		mockExecutionMgr *mocks.ExecutionManager
 		mockShard        *shardContextImpl
+		clusterMetadata  cluster.Metadata
 		cache            *historyCache
 	}
 )
@@ -62,6 +64,7 @@ func (s *historyCacheSuite) SetupTest() {
 	// Have to define our overridden assertions in the test setup. If we did it earlier, s.T() will return nil
 	s.Assertions = require.New(s.T())
 	s.mockExecutionMgr = &mocks.ExecutionManager{}
+	s.clusterMetadata = cluster.GetTestClusterMetadata(false, false)
 	s.mockShard = &shardContextImpl{
 		shardInfo:                 &persistence.ShardInfo{ShardID: 0, RangeID: 1, TransferAckLevel: 0},
 		transferSequenceNumber:    1,
@@ -72,6 +75,7 @@ func (s *historyCacheSuite) SetupTest() {
 		config:                    NewConfig(dynamicconfig.NewNopCollection(), 1),
 		logger:                    s.logger,
 		metricsClient:             metrics.NewClient(tally.NoopScope, metrics.History),
+		clusterMetadata:           s.clusterMetadata,
 	}
 	s.cache = newHistoryCache(s.mockShard, s.logger)
 }

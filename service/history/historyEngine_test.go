@@ -32,6 +32,7 @@ import (
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/cache"
+	"github.com/uber/cadence/common/cluster"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/mocks"
 	"github.com/uber/cadence/common/persistence"
@@ -61,6 +62,7 @@ type (
 		mockHistoryMgr     *mocks.HistoryManager
 		mockShardManager   *mocks.ShardManager
 		mockMetricClient   metrics.Client
+		clusterMetadata    cluster.Metadata
 		shardClosedCh      chan int
 		eventSerializer    historyEventSerializer
 		config             *Config
@@ -101,6 +103,7 @@ func (s *engineSuite) SetupTest() {
 	s.shardClosedCh = make(chan int, 100)
 	s.eventSerializer = newJSONHistoryEventSerializer()
 	s.mockMetricClient = metrics.NewClient(tally.NoopScope, metrics.History)
+	s.clusterMetadata = cluster.GetTestClusterMetadata(false, false)
 
 	historyEventNotifier := newHistoryEventNotifier(
 		s.mockMetricClient,
@@ -120,6 +123,7 @@ func (s *engineSuite) SetupTest() {
 		config:                    s.config,
 		logger:                    s.logger,
 		metricsClient:             metrics.NewClient(tally.NoopScope, metrics.History),
+		clusterMetadata:           s.clusterMetadata,
 	}
 	shardContextWrapper := &shardContextWrapper{
 		ShardContext:         mockShard,
@@ -139,9 +143,10 @@ func (s *engineSuite) SetupTest() {
 		tokenSerializer:      common.NewJSONTaskTokenSerializer(),
 		hSerializerFactory:   persistence.NewHistorySerializerFactory(),
 		historyEventNotifier: historyEventNotifier,
+		clusterMetadata:      s.clusterMetadata,
 	}
 	h.txProcessor = newTransferQueueProcessor(shardContextWrapper, h, s.mockVisibilityMgr, s.mockMatchingClient, s.mockHistoryClient)
-	h.timerProcessor = newTimerQueueProcessor(shardContextWrapper, h, s.mockExecutionMgr, s.logger)
+	h.timerProcessor = newTimerQueueProcessor(shardContextWrapper, h, s.mockExecutionMgr, s.clusterMetadata, s.logger)
 	h.historyEventNotifier.Start()
 	shardContextWrapper.txProcessor = h.txProcessor
 	s.mockHistoryEngine = h

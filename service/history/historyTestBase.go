@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/uber/cadence/common/cache"
+	"github.com/uber/cadence/common/cluster"
 
 	log "github.com/sirupsen/logrus"
 
@@ -55,6 +56,7 @@ type (
 		config                 *Config
 		logger                 bark.Logger
 		metricsClient          metrics.Client
+		clusterMetadata        cluster.Metadata
 	}
 
 	// TestBase wraps the base setup needed to create workflows over engine layer.
@@ -77,6 +79,7 @@ func newTestShardContext(shardInfo *persistence.ShardInfo, transferSequenceNumbe
 		config:                 config,
 		logger:                 logger,
 		metricsClient:          metrics.NewClient(tally.NoopScope, metrics.History),
+		clusterMetadata:        cluster.GetTestClusterMetadata(false, false),
 	}
 }
 
@@ -107,12 +110,30 @@ func (s *TestShardContext) GetTransferMaxReadLevel() int64 {
 
 // GetTransferAckLevel test implementation
 func (s *TestShardContext) GetTransferAckLevel() int64 {
-	return atomic.LoadInt64(&s.shardInfo.TransferAckLevel)
+	s.RLock()
+	defer s.RUnlock()
+
+	// TODO change make this cluster input parameter
+	cluster := s.clusterMetadata.GetCurrentClusterName()
+	// if can find corresponding ack level in the cluster to timer ack level map
+	if ackLevel, ok := s.shardInfo.ClusterTransferAckLevel[cluster]; ok {
+		return ackLevel
+	}
+	// otherwise, default to existing ack level, which belongs to local cluster
+	return s.shardInfo.TransferAckLevel
 }
 
 // UpdateTransferAckLevel test implementation
 func (s *TestShardContext) UpdateTransferAckLevel(ackLevel int64) error {
-	atomic.StoreInt64(&s.shardInfo.TransferAckLevel, ackLevel)
+	s.RLock()
+	defer s.RUnlock()
+
+	// TODO change make this cluster input parameter
+	cluster := s.clusterMetadata.GetCurrentClusterName()
+	if cluster == s.clusterMetadata.GetCurrentClusterName() {
+		s.shardInfo.TransferAckLevel = ackLevel
+	}
+	s.shardInfo.ClusterTransferAckLevel[cluster] = ackLevel
 	return nil
 }
 
@@ -124,15 +145,29 @@ func (s *TestShardContext) GetTransferSequenceNumber() int64 {
 // GetTimerAckLevel test implementation
 func (s *TestShardContext) GetTimerAckLevel() time.Time {
 	s.RLock()
-	defer s.RLock()
+	defer s.RUnlock()
+
+	// TODO change make this cluster input parameter
+	cluster := s.clusterMetadata.GetCurrentClusterName()
+	// if can find corresponding ack level in the cluster to timer ack level map
+	if ackLevel, ok := s.shardInfo.ClusterTimerAckLevel[cluster]; ok {
+		return ackLevel
+	}
+	// otherwise, default to existing ack level, which belongs to local cluster
 	return s.shardInfo.TimerAckLevel
 }
 
 // UpdateTimerAckLevel test implementation
 func (s *TestShardContext) UpdateTimerAckLevel(ackLevel time.Time) error {
-	s.Lock()
-	defer s.Unlock()
-	s.shardInfo.TimerAckLevel = ackLevel
+	s.RLock()
+	defer s.RUnlock()
+
+	// TODO change make this cluster input parameter
+	cluster := s.clusterMetadata.GetCurrentClusterName()
+	if cluster == s.clusterMetadata.GetCurrentClusterName() {
+		s.shardInfo.TimerAckLevel = ackLevel
+	}
+	s.shardInfo.ClusterTimerAckLevel[cluster] = ackLevel
 	return nil
 }
 

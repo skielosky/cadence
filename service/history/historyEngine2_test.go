@@ -40,6 +40,7 @@ import (
 	workflow "github.com/uber/cadence/.gen/go/shared"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/cache"
+	"github.com/uber/cadence/common/cluster"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/mocks"
 	"github.com/uber/cadence/common/persistence"
@@ -60,6 +61,7 @@ type (
 		mockExecutionMgr   *mocks.ExecutionManager
 		mockHistoryMgr     *mocks.HistoryManager
 		mockShardManager   *mocks.ShardManager
+		clusterMetadata    cluster.Metadata
 		shardClosedCh      chan int
 		eventSerializer    historyEventSerializer
 		config             *Config
@@ -100,6 +102,7 @@ func (s *engine2Suite) SetupTest() {
 	s.mockShardManager = &mocks.ShardManager{}
 	s.shardClosedCh = make(chan int, 100)
 	s.eventSerializer = newJSONHistoryEventSerializer()
+	s.clusterMetadata = cluster.GetTestClusterMetadata(false, false)
 
 	mockShard := &shardContextImpl{
 		shardInfo:                 &persistence.ShardInfo{ShardID: shardID, RangeID: 1, TransferAckLevel: 0},
@@ -113,6 +116,7 @@ func (s *engine2Suite) SetupTest() {
 		config:                    s.config,
 		logger:                    s.logger,
 		metricsClient:             metrics.NewClient(tally.NoopScope, metrics.History),
+		clusterMetadata:           s.clusterMetadata,
 	}
 
 	historyCache := newHistoryCache(mockShard, s.logger)
@@ -127,9 +131,10 @@ func (s *engine2Suite) SetupTest() {
 		metricsClient:      metrics.NewClient(tally.NoopScope, metrics.History),
 		tokenSerializer:    common.NewJSONTaskTokenSerializer(),
 		hSerializerFactory: persistence.NewHistorySerializerFactory(),
+		clusterMetadata:    s.clusterMetadata,
 	}
 	h.txProcessor = newTransferQueueProcessor(mockShard, h, s.mockVisibilityMgr, s.mockMatchingClient, s.mockHistoryClient)
-	h.timerProcessor = newTimerQueueProcessor(mockShard, h, s.mockExecutionMgr, s.logger)
+	h.timerProcessor = newTimerQueueProcessor(mockShard, h, s.mockExecutionMgr, s.clusterMetadata, s.logger)
 	s.historyEngine = h
 }
 

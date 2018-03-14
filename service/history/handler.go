@@ -113,7 +113,7 @@ func (h *Handler) Start() error {
 	}
 	h.hServiceResolver = hServiceResolver
 	h.controller = newShardController(h.GetHostInfo(), hServiceResolver, h.shardManager, h.historyMgr,
-		h.metadataMgr, h.executionMgrFactory, h, h.config, h.GetLogger(), h.GetMetricsClient())
+		h.metadataMgr, h.executionMgrFactory, h, h.config, h.GetLogger(), h.GetMetricsClient(), h.GetClusterMetadata())
 	h.metricsClient = h.GetMetricsClient()
 	h.historyEventNotifier = newHistoryEventNotifier(h.GetMetricsClient(), h.config.GetShardID)
 	// events notifier must starts before controller
@@ -138,7 +138,7 @@ func (h *Handler) Stop() {
 // CreateEngine is implementation for HistoryEngineFactory used for creating the engine instance for shard
 func (h *Handler) CreateEngine(context ShardContext) Engine {
 	return NewEngineWithShardContext(context, context.GetDomainCache(), h.visibilityMgr,
-		h.matchingServiceClient, h.historyServiceClient, h.historyEventNotifier)
+		h.matchingServiceClient, h.historyServiceClient, h.historyEventNotifier, h.GetClusterMetadata())
 }
 
 // Health is for health check
